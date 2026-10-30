@@ -1,0 +1,486 @@
+/*
+  ESP32 bio-signal monitor  (version WITHOUT level converter)
+
+  Sensors
+    MAX30102 (PPG)  -> HR, HRV (RMSSD), SpO2      on I2C bus B (Wire1)
+    MPU6050  (IMU)  -> X/Y/Z in g, motion noise   on I2C bus A (Wire)
+    TMP117   (temp) -> deg C and deg F            on I2C bus A (Wire)
+    EEG bio amp     -> Delta/Theta/Alpha/Beta/Gamma (analog output on GPIO34)
+
+  Connections (all sensors powered from the ESP32 3.3V pin, common GND)
+    Bus A : SDA = GPIO21, SCL = GPIO22   -> MPU6050 (AD0 to GND) + TMP117 (ADD0 to GND)
+    Bus B : SDA = GPIO25, SCL = GPIO26   -> MAX30102
+    EEG   : amp OUT -> GPIO34 (ADC1, input only)
+
+  Library needed (Library Manager):
+    "SparkFun MAX3010x Pulse and Proximity Sensor Library"
+  Board: ESP32 Dev Module   |   Serial Monitor: 115200 baud
+*/
+
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
+
+// ===================== TYPES =====================
+// NOTE: must be defined BEFORE any function that uses it, otherwise the
+// Arduino IDE's auto-generated prototypes fail with "'Bands' was not declared".
+// Index: 0=Delta 1=Theta 2=Alpha 3=Beta 4=Gamma
+struct Bands { float f[5]; float amp[5]; float pp; };   // peak freq (Hz), peak amplitude (uV), pk-pk (uV)
+
+// ===================== PINS =====================
+#define BUS_A_SDA 21
+#define BUS_A_SCL 22
+#define BUS_B_SDA 25
+#define BUS_B_SCL 26
+#define EEG_PIN   34
+
+#define MPU_ADDR  0x68
+#define TMP_ADDR  0x48
+
+// ===================== SETTINGS =====================
+// PPG
+const uint8_t  LED_BRIGHTNESS   = 0x7F;   // 0x00-0xFF. Raise if the signal is weak, lower if IR > ~250000
+const uint32_t FINGER_THRESHOLD = 50000;  // IR value above this = finger present
+// EEG
+const int   EEG_FS   = 250;               // samples per second
+const int   EEG_N    = 256;               // FFT size (power of 2)
+const float MAINS_HZ = 50.0;              // 50 for India/Europe, 60 for USA
+const float EEG_GAIN = 1.0;               // total gain of your bio amp. 1 = amplitude shown at the ADC pin;
+                                          // set it to your real gain to get amplitude at the scalp (uV)
+// IMU
+const int   IMU_WIN        = 50;          // samples in the noise window (about 1 s at 50 Hz)
+const float MOVE_THRESH_G  = 0.08;        // noise above this = "moving"
+
+// ===================== GLOBALS =====================
+MAX30105 particleSensor;
+
+bool ppgOK = false, imuOK = false, tmpOK = false;
+
+// ---- PPG ----
+uint32_t lastIR = 0;
+bool     fingerOn = false, ppgActive = false;
+uint32_t lastBeatMs = 0;
+const int IBI_MAX = 30;
+float ibiBuf[IBI_MAX];
+int   ibiCount = 0, rejectRun = 0;
+
+const int SPO2_LEN = 100;                  // 100 samples at 25 Hz = 4 s window
+uint32_t irBuf[SPO2_LEN], redBuf[SPO2_LEN];
+int  spo2Filled = 0, spo2New = 0, decN = 0;
+uint32_t sumIR = 0, sumRed = 0;
+float spo2Disp = 0;
+
+// ---- IMU ----
+float ax = 0, ay = 0, az = 0;
+float magBuf[IMU_WIN];
+int   magIdx = 0, magCount = 0;
+float motionNoise = 0;
+bool  isMoving = false;
+uint32_t lastImuMs = 0;
+
+// ---- EEG ----
+volatile float    eegBuf[EEG_N];
+volatile uint16_t eegRawBuf[EEG_N];
+volatile int      eegHead = 0;
+volatile uint32_t eegCount = 0;
+portMUX_TYPE eegMux = portMUX_INITIALIZER_UNLOCKED;
+
+uint32_t lastPrintMs = 0;
+
+// ===================== SMALL HELPERS =====================
+int imin(int a, int b) { return a < b ? a : b; }
+
+bool writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+int16_t read16(uint8_t hi, uint8_t lo) { return (int16_t)((hi << 8) | lo); }
+
+void scanBus(TwoWire &w, const char *name) {
+  Serial.printf("Scan %s:", name);
+  int n = 0;
+  for (uint8_t a = 1; a < 127; a++) {
+    w.beginTransmission(a);
+    if (w.endTransmission() == 0) { Serial.printf(" 0x%02X", a); n++; }
+  }
+  if (!n) Serial.print(" nothing found");
+  Serial.println();
+}
+
+// ===================== FFT (radix-2, in place) =====================
+void fft(float *re, float *im, int n) {
+  for (int i = 1, j = 0; i < n; i++) {
+    int bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      float t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (int len = 2; len <= n; len <<= 1) {
+    float ang = -2.0f * PI / len;
+    float wlr = cosf(ang), wli = sinf(ang);
+    int half = len >> 1;
+    for (int i = 0; i < n; i += len) {
+      float wr = 1.0f, wi = 0.0f;
+      for (int k = 0; k < half; k++) {
+        float ur = re[i + k], ui = im[i + k];
+        float vr = re[i + k + half] * wr - im[i + k + half] * wi;
+        float vi = re[i + k + half] * wi + im[i + k + half] * wr;
+        re[i + k] = ur + vr;            im[i + k] = ui + vi;
+        re[i + k + half] = ur - vr;     im[i + k + half] = ui - vi;
+        float t = wr * wlr - wi * wli;
+        wi = wr * wli + wi * wlr;
+        wr = t;
+      }
+    }
+  }
+}
+
+// ===================== EEG SAMPLING TASK (core 0) =====================
+void eegTask(void *param) {
+  // 50/60 Hz notch filter (biquad)
+  const float w0 = 2.0f * PI * MAINS_HZ / EEG_FS;
+  const float q = 30.0f;
+  const float alpha = sinf(w0) / (2.0f * q);
+  const float a0 = 1.0f + alpha;
+  const float b0 = 1.0f / a0, b1 = -2.0f * cosf(w0) / a0, b2 = 1.0f / a0;
+  const float a1 = -2.0f * cosf(w0) / a0, a2 = (1.0f - alpha) / a0;
+
+  float first = analogRead(EEG_PIN);
+  float x1 = first, x2 = first, y1 = first, y2 = first;
+
+  TickType_t last = xTaskGetTickCount();
+  for (;;) {
+    uint16_t raw = analogRead(EEG_PIN);
+    float x = raw;
+    float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1; x1 = x; y2 = y1; y1 = y;
+
+    portENTER_CRITICAL(&eegMux);
+    eegBuf[eegHead] = y;
+    eegRawBuf[eegHead] = raw;
+    eegHead = (eegHead + 1) % EEG_N;
+    eegCount++;
+    portEXIT_CRITICAL(&eegMux);
+
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(1000 / EEG_FS));
+  }
+}
+
+bool computeEEG(Bands &out, bool &saturated) {
+  static float re[EEG_N], im[EEG_N];
+  uint16_t rmin = 4095, rmax = 0;
+
+  portENTER_CRITICAL(&eegMux);
+  int head = eegHead;
+  for (int i = 0; i < EEG_N; i++) {
+    int idx = (head + i) % EEG_N;
+    re[i] = eegBuf[idx];
+    uint16_t r = eegRawBuf[idx];
+    if (r < rmin) rmin = r;
+    if (r > rmax) rmax = r;
+  }
+  portEXIT_CRITICAL(&eegMux);
+
+  float mean = 0, vmin = 1e9f, vmax = -1e9f;
+  for (int i = 0; i < EEG_N; i++) {
+    mean += re[i];
+    if (re[i] < vmin) vmin = re[i];
+    if (re[i] > vmax) vmax = re[i];
+  }
+  mean /= EEG_N;
+  const float uvPerCount = (3300.0f / 4095.0f) * 1000.0f / EEG_GAIN;   // ADC counts -> uV
+  out.pp = (vmax - vmin) * uvPerCount;
+  for (int i = 0; i < EEG_N; i++) {
+    float w = 0.5f * (1.0f - cosf(2.0f * PI * i / (EEG_N - 1)));   // Hann window
+    re[i] = (re[i] - mean) * w;
+    im[i] = 0;
+  }
+  fft(re, im, EEG_N);
+
+  float df = (float)EEG_FS / EEG_N;
+  static const float lo[5] = {0.5f, 4.0f, 8.0f, 13.0f, 30.0f};    // Delta, Theta, Alpha, Beta, Gamma
+  static const float hi[5] = {4.0f, 8.0f, 13.0f, 30.0f, 45.0f};
+  static float mag[EEG_N / 2];
+  for (int k = 0; k < EEG_N / 2; k++) mag[k] = sqrtf(re[k] * re[k] + im[k] * im[k]);
+  const float ampScale = 4.0f / EEG_N;                            // Hann window -> single-sided peak amplitude
+
+  bool any = false;
+  for (int b = 0; b < 5; b++) {
+    int best = -1;
+    float bestMag = 0;
+    for (int k = 1; k < EEG_N / 2; k++) {
+      float f = k * df;
+      if (f < lo[b]) continue;
+      if (f >= hi[b]) break;
+      if (mag[k] > bestMag) { bestMag = mag[k]; best = k; }
+    }
+    if (best < 0) { out.f[b] = 0; out.amp[b] = 0; continue; }
+
+    float off = 0;                                                // parabolic interpolation for finer Hz
+    if (best > 1 && best < EEG_N / 2 - 1) {
+      float m1 = mag[best - 1], m2 = mag[best], m3 = mag[best + 1];
+      float den = m1 - 2.0f * m2 + m3;
+      if (den != 0) off = 0.5f * (m1 - m3) / den;
+      if (off > 0.5f) off = 0.5f;
+      if (off < -0.5f) off = -0.5f;
+    }
+    out.f[b]   = (best + off) * df;                               // peak frequency in Hz
+    out.amp[b] = bestMag * ampScale * uvPerCount;                 // peak amplitude in uV
+    any = true;
+  }
+  if (!any) return false;
+  saturated = (rmin < 20 || rmax > 4075);
+  return true;
+}
+
+// ===================== IMU (MPU6050) =====================
+bool initMPU() {
+  if (!writeReg(MPU_ADDR, 0x6B, 0x00)) return false;   // wake up
+  delay(50);
+  writeReg(MPU_ADDR, 0x1A, 0x03);                      // low-pass filter ~44 Hz
+  writeReg(MPU_ADDR, 0x1C, 0x00);                      // +-2 g range (16384 LSB/g)
+  return true;
+}
+
+bool readMPU() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)6) != 6) return false;
+  uint8_t b[6];
+  for (int i = 0; i < 6; i++) b[i] = Wire.read();
+  ax = read16(b[0], b[1]) / 16384.0f;
+  ay = read16(b[2], b[3]) / 16384.0f;
+  az = read16(b[4], b[5]) / 16384.0f;
+  return true;
+}
+
+void serviceIMU() {
+  if (!imuOK) return;
+  uint32_t now = millis();
+  if (now - lastImuMs < 20) return;                    // 50 Hz
+  lastImuMs = now;
+  if (!readMPU()) return;
+
+  magBuf[magIdx] = sqrtf(ax * ax + ay * ay + az * az);
+  magIdx = (magIdx + 1) % IMU_WIN;
+  if (magCount < IMU_WIN) magCount++;
+
+  if (magCount >= 10) {
+    float m = 0;
+    for (int i = 0; i < magCount; i++) m += magBuf[i];
+    m /= magCount;
+    float v = 0;
+    for (int i = 0; i < magCount; i++) v += (magBuf[i] - m) * (magBuf[i] - m);
+    motionNoise = sqrtf(v / magCount);                 // std deviation of |acceleration| in g
+    isMoving = motionNoise > MOVE_THRESH_G;
+  }
+}
+
+// ===================== TEMP (TMP117) =====================
+bool readTemp(float &c) {
+  Wire.beginTransmission(TMP_ADDR);
+  Wire.write(0x00);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)TMP_ADDR, (uint8_t)2) != 2) return false;
+  uint8_t hi = Wire.read();
+  uint8_t lo = Wire.read();
+  c = read16(hi, lo) * 0.0078125f;
+  return true;
+}
+
+// ===================== PPG (MAX30102) =====================
+void resetPPG() {
+  lastBeatMs = 0;
+  ibiCount = 0; rejectRun = 0;
+  spo2Filled = 0; spo2New = 0; decN = 0;
+  sumIR = 0; sumRed = 0;
+  spo2Disp = 0;
+}
+
+void addIBI(float ibi) {
+  if (ibiCount >= 3) {
+    int n = imin(ibiCount, 5);
+    float m = 0;
+    for (int i = ibiCount - n; i < ibiCount; i++) m += ibiBuf[i];
+    m /= n;
+    if (fabsf(ibi - m) > 0.30f * m) {                  // artifact / missed beat
+      if (++rejectRun < 3) return;
+      ibiCount = 0;                                    // rate really changed, restart
+    }
+    rejectRun = 0;
+  }
+  if (ibiCount == IBI_MAX) {
+    memmove(ibiBuf, ibiBuf + 1, (IBI_MAX - 1) * sizeof(float));
+    ibiCount--;
+  }
+  ibiBuf[ibiCount++] = ibi;
+}
+
+void pushSpo2(uint32_t red, uint32_t ir) {
+  if (spo2Filled == SPO2_LEN) {
+    memmove(irBuf, irBuf + 1, (SPO2_LEN - 1) * sizeof(uint32_t));
+    memmove(redBuf, redBuf + 1, (SPO2_LEN - 1) * sizeof(uint32_t));
+    spo2Filled--;
+  }
+  irBuf[spo2Filled] = ir;
+  redBuf[spo2Filled] = red;
+  spo2Filled++;
+  spo2New++;
+
+  if (spo2Filled == SPO2_LEN && spo2New >= 25) {       // recalculate every 1 s
+    spo2New = 0;
+    int32_t spo2 = 0, hrAlg = 0;
+    int8_t spo2Valid = 0, hrValid = 0;
+    maxim_heart_rate_and_oxygen_saturation(irBuf, SPO2_LEN, redBuf, &spo2, &spo2Valid, &hrAlg, &hrValid);
+    if (spo2Valid && spo2 >= 70 && spo2 <= 100) {
+      spo2Disp = (spo2Disp == 0) ? spo2 : 0.7f * spo2Disp + 0.3f * spo2;
+    }
+  }
+}
+
+void servicePPG() {
+  particleSensor.check();
+  while (particleSensor.available()) {
+    uint32_t red = particleSensor.getFIFORed();
+    uint32_t ir  = particleSensor.getFIFOIR();
+    particleSensor.nextSample();
+
+    lastIR = ir;
+    fingerOn = ir > FINGER_THRESHOLD;
+    if (!fingerOn) {
+      if (ppgActive) { resetPPG(); ppgActive = false; }
+      continue;
+    }
+    ppgActive = true;
+
+    if (checkForBeat((int32_t)ir)) {
+      uint32_t now = millis();
+      if (lastBeatMs) {
+        uint32_t ibi = now - lastBeatMs;
+        if (ibi >= 300 && ibi <= 1500 && !isMoving) addIBI((float)ibi);   // 40-200 bpm
+      }
+      lastBeatMs = now;
+    }
+
+    sumIR += ir; sumRed += red;
+    if (++decN == 4) {                                 // 100 Hz -> 25 Hz for the SpO2 algorithm
+      pushSpo2(sumRed / 4, sumIR / 4);
+      sumIR = 0; sumRed = 0; decN = 0;
+    }
+  }
+}
+
+// ===================== REPORT =====================
+void printReport() {
+  Serial.println(F("--------------------------------------------------"));
+
+  // ---- PPG ----
+  if (!ppgOK) {
+    Serial.println(F("PPG  : MAX30102 not found"));
+  } else if (!fingerOn) {
+    Serial.printf("PPG  : place finger on sensor (IR=%lu)\n", (unsigned long)lastIR);
+  } else {
+    float hr = 0;
+    if (ibiCount >= 3) {
+      int n = imin(ibiCount, 5);
+      float m = 0;
+      for (int i = ibiCount - n; i < ibiCount; i++) m += ibiBuf[i];
+      hr = 60000.0f / (m / n);
+    }
+    float rmssd = -1;
+    if (ibiCount >= 8) {
+      float s = 0;
+      for (int i = 1; i < ibiCount; i++) { float d = ibiBuf[i] - ibiBuf[i - 1]; s += d * d; }
+      rmssd = sqrtf(s / (ibiCount - 1));
+    }
+    Serial.print(F("PPG  : HR "));
+    if (hr > 0) Serial.printf("%.0f bpm", hr); else Serial.print(F("-- "));
+    Serial.print(F(" | HRV(RMSSD) "));
+    if (rmssd >= 0) Serial.printf("%.0f ms", rmssd); else Serial.print(F("collecting.."));
+    Serial.print(F(" | SpO2 "));
+    if (spo2Disp > 0) Serial.printf("%.0f %%", spo2Disp); else Serial.print(F("--"));
+    Serial.printf(" | IR=%lu\n", (unsigned long)lastIR);
+  }
+
+  // ---- EEG ----
+  if (eegCount < (uint32_t)(EEG_N + EEG_FS)) {
+    Serial.println(F("EEG  : warming up..."));
+  } else {
+    Bands b; bool sat = false;
+    if (computeEEG(b, sat)) {
+      Serial.printf("EEG  : Delta %.2f Hz (%.1f uV) | Theta %.2f Hz (%.1f uV) | Alpha %.2f Hz (%.1f uV) | Beta %.2f Hz (%.1f uV) | Gamma %.2f Hz (%.1f uV) | pk-pk %.1f uV%s\n",
+                    b.f[0], b.amp[0], b.f[1], b.amp[1], b.f[2], b.amp[2], b.f[3], b.amp[3], b.f[4], b.amp[4],
+                    b.pp, sat ? "  [SIGNAL SATURATED - check electrodes/wiring]" : "");
+    } else {
+      Serial.println(F("EEG  : no signal"));
+    }
+  }
+
+  // ---- IMU ----
+  if (!imuOK) {
+    Serial.println(F("IMU  : MPU6050 not found"));
+  } else {
+    Serial.printf("IMU  : X %.3f g | Y %.3f g | Z %.3f g | noise(SD) %.4f g [%s]\n",
+                  ax, ay, az, motionNoise, isMoving ? "moving" : "still");
+  }
+
+  // ---- TEMP ----
+  float c;
+  if (tmpOK && readTemp(c)) {
+    Serial.printf("TEMP : %.2f C | %.2f F\n", c, c * 9.0f / 5.0f + 32.0f);
+  } else {
+    Serial.println(F("TEMP : TMP117 not found"));
+  }
+}
+
+// ===================== SETUP / LOOP =====================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println(F("\nESP32 bio-signal monitor starting..."));
+
+  Wire.begin(BUS_A_SDA, BUS_A_SCL);
+  Wire.setClock(100000);
+  Wire1.begin(BUS_B_SDA, BUS_B_SCL);
+  Wire1.setClock(100000);
+
+  scanBus(Wire,  "bus A (expect 0x48 TMP117, 0x68 MPU6050)");
+  scanBus(Wire1, "bus B (expect 0x57 MAX30102)");
+
+  imuOK = initMPU();
+  Wire.beginTransmission(TMP_ADDR);
+  tmpOK = (Wire.endTransmission() == 0);
+
+  // Wire1 is already started above with its own pins; pass it to the library
+  ppgOK = particleSensor.begin(Wire1, I2C_SPEED_STANDARD);
+  if (ppgOK) {
+    // brightness, avg 4, red+IR, 400 sps (=100 Hz after averaging), pulse width 411, ADC range 16384
+    particleSensor.setup(LED_BRIGHTNESS, 4, 2, 400, 411, 16384);
+  }
+
+  Serial.printf("Status -> PPG:%s  IMU:%s  TEMP:%s\n",
+                ppgOK ? "OK" : "FAIL", imuOK ? "OK" : "FAIL", tmpOK ? "OK" : "FAIL");
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(EEG_PIN, ADC_11db);
+  xTaskCreatePinnedToCore(eegTask, "eeg", 4096, NULL, 2, NULL, 0);
+}
+
+void loop() {
+  if (ppgOK) servicePPG();
+  serviceIMU();
+
+  uint32_t now = millis();
+  if (now - lastPrintMs >= 1000) {
+    lastPrintMs = now;
+    printReport();
+  }
+}

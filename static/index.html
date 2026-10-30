@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Live biosignal dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="bg-glow" aria-hidden="true"></div>
+  <header class="top">
+    <div class="brand">
+      <span class="logo-dot"></span>
+      <div>
+        <h1>Live biosignal</h1>
+        <p class="tag">Pulse, brain-wave bands, motion, skin temperature</p>
+      </div>
+    </div>
+    <div class="controls">
+      <label class="field">
+        <span>COM port</span>
+        <select id="port"></select>
+      </label>
+      <button type="button" class="btn ghost" id="refreshPorts" title="Refresh ports">?</button>
+      <button type="button" class="btn primary" id="connectBtn">Connect</button>
+      <button type="button" class="btn" id="demoBtn">Demo Mode</button>
+      <button type="button" class="btn" id="calBtn">Calibration</button>
+      <button type="button" class="btn" id="recBtn">Record session</button>
+      <a class="btn" id="exportBtn" href="/api/export.csv">Export CSV</a>
+    </div>
+  </header>
+
+  <div id="banner" class="banner hidden" role="status"></div>
+  <div id="calPanel" class="cal hidden">
+    <div class="cal-ring"><span id="calCount">30</span></div>
+    <div>
+      <p class="cal-kicker" id="calPhase">Eyes closed</p>
+      <p id="calPrompt"></p>
+    </div>
+  </div>
+
+  <main>
+    <section class="row live-row">
+      <article class="card heart-card">
+        <p class="kicker">Heart rate</p>
+        <div class="heart-wrap">
+          <div class="heart" id="heart">
+            <svg viewBox="0 0 32 29" aria-hidden="true">
+              <path d="M16 27S1 17 1 8.5C1 4 4.5 1 8.5 1 12 1 14.5 3 16 5.5 17.5 3 20 1 23.5 1 27.5 1 31 4 31 8.5 31 17 16 27 16 27Z"/>
+            </svg>
+          </div>
+          <div>
+            <div class="big"><span id="hr">--</span><span class="unit">BPM</span></div>
+            <p class="sub" id="hrNote">Waiting</p>
+          </div>
+        </div>
+        <canvas id="ppgWave" class="wave" width="560" height="90"></canvas>
+        <p class="caption">Pulse waveform</p>
+      </article>
+
+      <article class="card">
+        <p class="kicker">Brain-wave bands</p>
+        <div class="bands" id="bands"></div>
+        <canvas id="eegWave" class="wave" width="560" height="90"></canvas>
+        <p class="caption">Live brain-wave trace</p>
+      </article>
+
+      <div class="stack">
+        <article class="card temp-card">
+          <p class="kicker">Skin temperature</p>
+          <div class="big"><span id="temp">--</span><span class="unit">°C</span></div>
+          <canvas id="tempWave" class="wave short" width="400" height="70"></canvas>
+        </article>
+        <article class="card">
+          <p class="kicker">Motion</p>
+          <div class="motion" id="motionBox">
+            <div class="orb" id="orb"></div>
+            <p id="motionLabel">Still</p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="row results-row" id="resultCards">
+      <article class="card result" data-key="vigilance">
+        <p class="kicker">Vigilance / Drowsiness</p>
+        <div class="score-line">
+          <span class="score" id="vigScore">--</span>
+          <span class="outof">/ 100</span>
+          <span class="pill" id="vigColor">-</span>
+        </div>
+        <p class="meaning" id="vigMeaning">Waiting for a signal.</p>
+        <p class="tip" id="vigTip"></p>
+        <p class="conf" id="vigConf"></p>
+      </article>
+
+      <article class="card result" data-key="attention">
+        <p class="kicker">Attention / Focus</p>
+        <p class="trend" id="attTrend">-</p>
+        <p class="meaning" id="attLabel">Waiting for a signal.</p>
+        <p class="tip" id="attTip"></p>
+        <p class="note" id="attNote"></p>
+        <p class="conf" id="attConf"></p>
+      </article>
+
+      <article class="card result" data-key="mood">
+        <p class="kicker">Mood Lean</p>
+        <div class="gauge" id="moodGauge">
+          <div class="gauge-track">
+            <span class="g-left">Withdrawal</span>
+            <span class="g-right">Approach</span>
+            <div class="needle" id="moodNeedle"></div>
+          </div>
+        </div>
+        <p class="meaning" id="moodMsg">Mood Lean needs two forehead electrodes</p>
+        <p class="tip" id="moodTip"></p>
+        <p class="conf" id="moodConf"></p>
+      </article>
+
+      <article class="card result" data-key="autonomic">
+        <p class="kicker">Autonomic Balance</p>
+        <div id="autoWait" class="wait">
+          <div class="bar"><div class="bar-fill" id="autoFill"></div></div>
+          <p id="autoWaitMsg">Collecting data...</p>
+        </div>
+        <div id="autoReady" class="hidden">
+          <p class="trend" id="autoLean">-</p>
+          <p class="meaning" id="autoMeaning"></p>
+          <p class="note" id="autoAgree"></p>
+        </div>
+        <p class="tip" id="autoTip"></p>
+        <p class="conf" id="autoConf"></p>
+      </article>
+    </section>
+
+    <section class="card history-card">
+      <p class="kicker">Session history</p>
+      <canvas id="history" width="1100" height="260"></canvas>
+      <div class="legend">
+        <span class="lg vig">Vigilance</span>
+        <span class="lg att">Attention</span>
+        <span class="lg mood">Mood (if available)</span>
+        <span class="lg auto">Autonomic calm</span>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Trend indicators for information only, not medical diagnoses.
+  </footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
